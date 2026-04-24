@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 
 from PIL import Image
 
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.svm import LinearSVC, SVC
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
@@ -165,7 +167,7 @@ def compute_multilabel_metrics(all_labels, all_preds):
     }
 
 
-def tune_pca_and_classifier(X_train, Y_train, X_val, Y_val):
+def tune_pca_and_classifier(X_train, Y_train, X_val, Y_val, clf):
     candidate_components = [64, 128, 256, 512]
     candidate_thresholds = [0.3, 0.4, 0.5, 0.6]
 
@@ -181,12 +183,29 @@ def tune_pca_and_classifier(X_train, Y_train, X_val, Y_val):
         X_train_pca = pca.fit_transform(X_train)
         X_val_pca = pca.transform(X_val)
 
-        classifier = OneVsRestClassifier(
-            LogisticRegression(
-                max_iter=1000,
-                solver="liblinear"
+        if clf == "logistic":
+            classifier = OneVsRestClassifier(
+                LogisticRegression(
+                    max_iter=1000,
+                    solver="liblinear"
+                )
             )
-        )
+        elif clf == "svm":
+            base_svm = LinearSVC(
+                C=1.0,
+                max_iter=5000,
+                dual=False,
+                random_state=42,
+            )
+            calibrated_svm = CalibratedClassifierCV(
+                estimator=base_svm,
+                method="sigmoid",
+                cv=3,
+            )
+            classifier = OneVsRestClassifier(calibrated_svm)
+        else:
+            raise ValueError("clf must be 'logistic' or 'svm'")
+
         classifier.fit(X_train_pca, Y_train)
 
         val_probs = classifier.predict_proba(X_val_pca)
@@ -442,12 +461,12 @@ def main():
     print("Y_test shape:", Y_test.shape)
 
     best_pca, best_classifier, best_result, results = tune_pca_and_classifier(
-        X_train, Y_train, X_val, Y_val
+        X_train, Y_train, X_val, Y_val, clf="logistic"
     )
 
-    best_pca, best_classifier, best_result, results = tune_pca_and_classifier(
-        X_train, Y_train, X_val, Y_val
-    )
+    # best_pca_svm, best_classifier_svm, best_result_svm, results_svm = tune_pca_and_classifier(
+    #     X_train, Y_train, X_val, Y_val, clf="svm"
+    # )
 
     plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_results_f1.png")
 
