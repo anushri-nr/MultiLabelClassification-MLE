@@ -14,6 +14,8 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.multiclass import OneVsRestClassifier
+from sklearn.metrics import f1_score
+
 
 import torch
 import torch.nn as nn
@@ -167,14 +169,46 @@ def compute_multilabel_metrics(all_labels, all_preds):
     }
 
 
+def tune_per_class_thresholds(val_probs, Y_val, threshold_grid=None):
+    if threshold_grid is None:
+        threshold_grid = np.arange(0.1, 0.91, 0.05)
+
+    num_classes = Y_val.shape[1]
+    best_thresholds = np.zeros(num_classes, dtype=np.float32)
+
+    print("\nPer-class threshold tuning:")
+    for class_idx in range(num_classes):
+        y_true = Y_val[:, class_idx]
+        class_probs = val_probs[:, class_idx]
+
+        best_threshold = 0.5
+        best_score = -1.0
+
+        for threshold in threshold_grid:
+            y_pred = (class_probs >= threshold).astype(np.float32)
+            score = f1_score(y_true, y_pred, zero_division=0)
+
+            if score > best_score:
+                best_score = score
+                best_threshold = threshold
+
+        best_thresholds[class_idx] = best_threshold
+        print(
+            f"{LABEL_ORDER[class_idx]}: "
+            f"best_threshold={best_threshold:.2f}, class_f1={best_score:.4f}"
+        )
+
+    return best_thresholds
+
+
 def tune_pca_and_classifier(X_train, Y_train, X_val, Y_val, clf):
     candidate_components = [64, 128, 256, 512]
-    candidate_thresholds = [0.3, 0.4, 0.5, 0.6]
 
     results = []
     best_result = None
     best_pca = None
     best_classifier = None
+    best_thresholds = None
 
     for n_components in candidate_components:
         print(f"\nTesting PCA n_components = {n_components}")
@@ -207,42 +241,41 @@ def tune_pca_and_classifier(X_train, Y_train, X_val, Y_val, clf):
             raise ValueError("clf must be 'logistic' or 'svm'")
 
         classifier.fit(X_train_pca, Y_train)
-
         val_probs = classifier.predict_proba(X_val_pca)
 
-        for threshold in candidate_thresholds:
-            val_preds = (val_probs >= threshold).astype(np.float32)
-            metrics = compute_multilabel_metrics(Y_val, val_preds)
+        class_thresholds = tune_per_class_thresholds(val_probs, Y_val)
+        val_preds = (val_probs >= class_thresholds).astype(np.float32)
+        metrics = compute_multilabel_metrics(Y_val, val_preds)
 
-            row = {
-                "n_components": n_components,
-                "threshold": threshold,
-                **metrics,
-            }
-            results.append(row)
+        row = {
+            "n_components": n_components,
+            "thresholds": class_thresholds.tolist(),
+            **metrics,
+        }
+        results.append(row)
 
-            print(
-                f"threshold={threshold:.1f} | "
-                f"f1_micro={metrics['f1_micro']:.4f} | "
-                f"mean_iou={metrics['mean_iou']:.4f} | "
-                f"exact_match={metrics['exact_match']:.4f}"
-            )
+        print(
+            f"f1_micro={metrics['f1_micro']:.4f} | "
+            f"mean_iou={metrics['mean_iou']:.4f} | "
+            f"exact_match={metrics['exact_match']:.4f}"
+        )
 
-            if best_result is None or metrics["f1_micro"] > best_result["f1_micro"]:
-                best_result = row
-                best_pca = pca
-                best_classifier = classifier
+        if best_result is None or metrics["f1_micro"] > best_result["f1_micro"]:
+            best_result = row
+            best_pca = pca
+            best_classifier = classifier
+            best_thresholds = class_thresholds
 
     print("\nBest validation result:")
     print(best_result)
 
-    return best_pca, best_classifier, best_result, results
+    return best_pca, best_classifier, best_thresholds, best_result, results
 
 
-def evaluate_on_test(pca, classifier, threshold, X_test, Y_test):
+def evaluate_on_test(pca, classifier, thresholds, X_test, Y_test):
     X_test_pca = pca.transform(X_test)
     test_probs = classifier.predict_proba(X_test_pca)
-    test_preds = (test_probs >= threshold).astype(np.float32)
+    test_preds = (test_probs >= thresholds).astype(np.float32)
 
     metrics = compute_multilabel_metrics(Y_test, test_preds)
 
@@ -253,13 +286,13 @@ def evaluate_on_test(pca, classifier, threshold, X_test, Y_test):
     return metrics
 
 
-def save_model_bundle(output_path, pca, classifier, threshold=0.5):
+def save_model_bundle(output_path, pca, classifier, thresholds):
     bundle = {
         "encoder_name": "vgg16",
         "encoder_state_dict": None,
         "pca": pca,
         "classifier": classifier,
-        "threshold": threshold,
+        "thresholds": thresholds,
     }
 
     with open(output_path, "wb") as f:
@@ -269,20 +302,18 @@ def save_model_bundle(output_path, pca, classifier, threshold=0.5):
 
 def plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_results.png"):
     results_df = pd.DataFrame(results)
-    results_df = results_df.sort_values(["threshold", "n_components"])
+    results_df = results_df.sort_values("n_components")
 
-    plt.figure(figsize=(9, 5.5))
+    plt.figure(figsize=(8, 5.5))
 
-    for threshold in sorted(results_df["threshold"].unique()):
-        subset = results_df[results_df["threshold"] == threshold]
-        plt.plot(
-            subset["n_components"],
-            subset[metric_name],
-            marker="o",
-            linewidth=2,
-            markersize=7,
-            label=f"Threshold = {threshold}"
-        )
+    plt.plot(
+        results_df["n_components"],
+        results_df[metric_name],
+        marker="o",
+        linewidth=2,
+        markersize=8,
+        color="steelblue"
+    )
 
     best_idx = results_df[metric_name].idxmax()
     best_row = results_df.loc[best_idx]
@@ -299,7 +330,7 @@ def plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_resul
 
     plt.annotate(
         f"Best: {metric_name}={best_row[metric_name]:.4f}\n"
-        f"components={int(best_row['n_components'])}, threshold={best_row['threshold']}",
+        f"components={int(best_row['n_components'])}",
         xy=(best_row["n_components"], best_row[metric_name]),
         xytext=(10, 15),
         textcoords="offset points",
@@ -311,13 +342,12 @@ def plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_resul
     plt.ylabel(metric_name.replace("_", " ").title(), fontsize=11)
     plt.xticks(sorted(results_df["n_components"].unique()))
     plt.grid(True, linestyle="--", alpha=0.4)
-    plt.legend(frameon=True)
 
     plt.subplots_adjust(bottom=0.2)
     plt.figtext(
         0.5,
         0.02,
-        "Validation Performance Across PCA Components and Thresholds",
+        "Validation Performance Across PCA Components with Per-Class Threshold Tuning",
         ha="center",
         fontsize=12
     )
@@ -389,7 +419,7 @@ def visualize_test_predictions(model_bundle, dataset, test_indices, X_test, Y_te
     encoder = model_bundle["encoder"]
     pca = model_bundle["pca"]
     classifier = model_bundle["classifier"]
-    threshold = model_bundle["threshold"]
+    thresholds = np.asarray(model_bundle["thresholds"], dtype=np.float32)
 
     chosen = np.random.choice(len(test_indices), size=min(num_samples, len(test_indices)), replace=False)
 
@@ -411,7 +441,7 @@ def visualize_test_predictions(model_bundle, dataset, test_indices, X_test, Y_te
             scores = classifier.decision_function(x_features_pca)[0]
             probs = 1.0 / (1.0 + np.exp(-scores))
 
-        pred_target = (probs >= threshold).astype(np.float32)
+        pred_target = (probs >= thresholds).astype(np.float32)
 
         true_labels = [LABEL_ORDER[i] for i, v in enumerate(Y_test[test_pos]) if v == 1]
         pred_labels = [LABEL_ORDER[i] for i, v in enumerate(pred_target) if v == 1]
@@ -460,9 +490,10 @@ def main():
     print("X_test shape:", X_test.shape)
     print("Y_test shape:", Y_test.shape)
 
-    best_pca, best_classifier, best_result, results = tune_pca_and_classifier(
-        X_train, Y_train, X_val, Y_val, clf="logistic"
-    )
+    best_pca, best_classifier, best_thresholds, best_result, results = tune_pca_and_classifier(
+    X_train, Y_train, X_val, Y_val, clf="logistic"
+)
+
 
     # best_pca_svm, best_classifier_svm, best_result_svm, results_svm = tune_pca_and_classifier(
     #     X_train, Y_train, X_val, Y_val, clf="svm"
@@ -474,19 +505,21 @@ def main():
 
 
     evaluate_on_test(
-        pca=best_pca,
-        classifier=best_classifier,
-        threshold=best_result["threshold"],
-        X_test=X_test,
-        Y_test=Y_test,
-    )
+    pca=best_pca,
+    classifier=best_classifier,
+    thresholds=best_thresholds,
+    X_test=X_test,
+    Y_test=Y_test,
+)
+
 
     save_model_bundle(
-        output_path="vgg_pca_logreg.pkl",
-        pca=best_pca,
-        classifier=best_classifier,
-        threshold=best_result["threshold"],
-    )
+    output_path="vgg_pca_logreg.pkl",
+    pca=best_pca,
+    classifier=best_classifier,
+    thresholds=best_thresholds,
+)
+
 
     print("\nSaved tuned model to vgg_pca_logreg.pkl")
     print("Training complete.")
