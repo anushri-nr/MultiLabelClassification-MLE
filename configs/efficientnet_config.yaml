@@ -1,0 +1,13 @@
+model:
+  backbone: "efficientnet_b3"
+  num_classes: 12
+
+training:
+  num_epochs: 50
+  val_every: 5
+
+optimizer:
+  lr: 0.001
+
+wandb:
+  project_prefix: "mle-multi"

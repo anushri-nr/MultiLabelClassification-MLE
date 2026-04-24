@@ -17,17 +17,18 @@ import sys
 import time
 import argparse
 import re
+import os
 
 from pathlib import Path
 from PIL import Image
-
-import pickle
-import numpy as np
-
+import numpy as np 
 import torch
 import torch.nn as nn
 from torchvision import models, datasets, transforms
 from torch.utils.data import DataLoader, Dataset
+import joblib
+from sklearn.pipeline import Pipeline
+
 
 LABEL_ORDER = ["pen", "paper", "book", "clock", "phone", "laptop", "chair", "desk", "bottle", "keychain", "backpack", "calculator"]
 VALID_LABELS = set(LABEL_ORDER)
@@ -79,6 +80,43 @@ class CustomDirectoryLayoutDataset(Dataset):
             image = self.transform(image)
         return image, target
 
+class LatentNet(nn.Module):
+    """
+    VGG16 encoder + PCA + classifier (LogReg or SVM), wrapped to behave like
+    a PyTorch classifier so it plugs into predict() / evaluate_model().
+    """
+
+    def __init__(self, pipeline, device):
+        super().__init__()
+        vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
+        self.features = vgg.features
+        self.avgpool = vgg.avgpool
+        for p in self.parameters():
+            p.requires_grad = False
+
+        self.pipeline = pipeline
+        self.to(device)
+
+    def forward(self, x):
+        # x: (B, 3, 128, 128) on device
+        with torch.no_grad():
+            feats = self.features(x)
+            feats = self.avgpool(feats)
+            feats = torch.flatten(feats, 1).cpu().numpy()
+
+        if hasattr(self.pipeline, "predict_proba"):
+            probs = self.pipeline.predict_proba(feats)
+        else:
+            # SVM without probability=True → fall back to decision_function
+            scores = self.pipeline.decision_function(feats)
+            probs = 1.0 / (1.0 + np.exp(-scores))
+
+        # invert sigmoid so predict()'s torch.sigmoid recovers the originals
+        probs = np.clip(probs, 1e-7, 1 - 1e-7)
+        logits = np.log(probs / (1 - probs))
+
+        return torch.tensor(logits, dtype=torch.float32, device=x.device)
+
 
 ######### Functions #########
 
@@ -111,79 +149,65 @@ def load_test_dataset(data_dir, batch_size, num_workers, image_size, shuffle=Fal
                             num_workers=num_workers, pin_memory=True)
     return test_loader
 
+def build_cnn(num_classes, backbone, pretrained = True, frozen = False):
+  backbone = backbone.lower()
+  if backbone == "resnet50":
+    model = models.resnet50(weights = models.ResNet50_Weights.DEFAULT if pretrained else None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
 
-def load_trained_model(model_path, num_labels, device, image_size):
-    """
-    Builds your model architecture, adjusts the classification head to
-    the given number of classes, and loads the trained model weights from a local file.
+  elif backbone == "densenet121":
+    model = models.densenet121(weights = models.DenseNet121_Weights.DEFAULT if pretrained else None)
+    model.classifier = nn.Linear(model.classifier.in_features, num_classes)
 
-    Args:
-        model_path (str): Path to the trained model checkpoint.
-        num_labels (int): Number of output labels. (Should be 12 but left for consistency.)
-        device (str): Device for model loading ('cuda' or 'cpu').
-        image_size (int): desired input image size. (Not used here but kept for consistency.)
+  elif backbone == "efficientnet_b3":
+    model = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT if pretrained else None)
+    in_features = model.classifier[1].in_features
+    model.classifier = nn.Linear(in_features, num_classes)
 
-    Returns:
-        model: The model loaded on device. (If you are not using pytorch nn.Module directly, it is fine but make sure what it loads is compatible with the rest of the code.)
-    """
+  else:
+        raise ValueError(f"Unsupported backbone '{backbone}'")
 
-    # model = CREATE_YOUR_MODEL_HERE(num_labels=num_labels) # Replace with your model creation function
+  if frozen:
+    for param in model.parameters():
+      param.requires_grad = False
 
-    ## Change/rewrite the rest of the function as needed, but make sure what it outputs works with the other functions (e.g., predict)
+  return model
 
-    # Load local state dictionary
-    # state_dict = torch.load(model_path, map_location=device)
-    # model.load_state_dict(state_dict)
 
-    # # Move the model to the specified device and set evaluation mode.
-    # model = model.to(device)
-    # model.eval()
 
-    # return model
-    del num_labels, image_size
+def load_trained_model(model_path, num_classes, device):
+    model_name = os.path.basename(model_path).split(".")[0]
+    _, ext = os.path.splitext(model_path)  # ext = ".pth", ".pkl", etc.
 
-    with open(model_path, "rb") as f:
-        bundle = pickle.load(f)
+    if ext  == ".ckpt":
+        model = build_cnn(num_classes=num_classes, backbone=model_name, pretrained=False)
 
-    encoder_name = bundle.get("encoder_name", "vgg16")
-    encoder = create_encoder(device, encoder_name)
+        ckpt = torch.load(model_path, map_location=device, weights_only=False)
 
-    pca = bundle["pca"]
-    classifier = bundle["classifier"]
-    threshold = bundle.get("threshold", 0.5)
+        # Handle Lightning checkpoint
+        state_dict = {
+            k.replace("model.", "", 1): v
+            for k, v in ckpt["state_dict"].items()
+            if k.startswith("model.")
+        }
 
-    model = {
-        "encoder": encoder,
-        "pca": pca,
-        "classifier": classifier,
-        "threshold": threshold,
-    }
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"Loaded checkpoint. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        if missing:    print("  missing[:5]:", missing[:5])
+        if unexpected: print("  unexpected[:5]:", unexpected[:5])
+
+        model = model.to(device)
+
+    elif ext == ".pkl":
+        loaded = joblib.load(model_path)
+        pipeline = Pipeline([('pca', loaded['pca']), ('clf', loaded['classifier'])])
+        threshold = loaded.get('threshold', 0.5)  # 0.4 for LogReg, 0.3 for SVM
+        model = LatentNet(pipeline, device=device)
+    else:
+        raise ValueError(f"Unsupported model format: {ext}")
+
+    model.eval()
     return model
-
-class VGGEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        weights = models.VGG16_Weights.DEFAULT
-        vgg = models.vgg16(weights=weights)
-        self.features = vgg.features
-        self.avgpool = vgg.avgpool
-
-        for param in self.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        return x
-
-def create_encoder(device, encoder_name="vgg16"):
-    if encoder_name != "vgg16":
-        raise ValueError(f"Unsupported encoder: {encoder_name}")
-    encoder = VGGEncoder().to(device)
-    encoder.eval()
-    return encoder
-
 
 def predict(model, x, threshold=0.5):
     """
@@ -202,39 +226,11 @@ def predict(model, x, threshold=0.5):
 
     ## Change/rewrite the function as needed, but make sure it outputs predictions in a way that it works with the rest of the code
     ## the code below assumes your model outputs logits, change it if needed...
-    # with torch.no_grad():
-    #     logits = model(x)
-    #     probs = torch.sigmoid(logits)
-    #     preds = (probs >= threshold).float()
-    # return preds, probs, logits     # the code needs to return all of this for evaluate_model() to work!
-    encoder = model["encoder"]
-    pca = model["pca"]
-    classifier = model["classifier"]
-
     with torch.no_grad():
-        features = encoder(x)
-        features = features.cpu().numpy()
-
-    features_pca = pca.transform(features)
-
-    if hasattr(classifier, "predict_proba"):
-        probs = classifier.predict_proba(features_pca)
-    else:
-        scores = classifier.decision_function(features_pca)
-        probs = 1.0 / (1.0 + np.exp(-scores))
-
-    probs = np.asarray(probs, dtype=np.float32)
-    preds = (probs >= threshold).astype(np.float32)
-
-    clipped = np.clip(probs, 1e-6, 1 - 1e-6)
-    logits = np.log(clipped / (1.0 - clipped))
-
-    preds = torch.from_numpy(preds).float().to(x.device)
-    probs = torch.from_numpy(probs).float().to(x.device)
-    logits = torch.from_numpy(logits).float().to(x.device)
-
-
-    return preds, probs, logits
+        logits = model(x)
+        probs = torch.sigmoid(logits)
+        preds = (probs >= threshold).float()
+    return preds, probs, logits     # the code needs to return all of this for evaluate_model() to work!
 
 
 def evaluate_model(model, test_loader, device, threshold=0.5):
@@ -249,7 +245,7 @@ def evaluate_model(model, test_loader, device, threshold=0.5):
     Returns:
         tuple: (test_loss, test_accuracy)
     """
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()  # again this assumes the model output is logits
     running_loss = 0.0
     total_samples = 0
 
@@ -265,7 +261,7 @@ def evaluate_model(model, test_loader, device, threshold=0.5):
             preds, probs, logits = predict(model, images, threshold=threshold)
 
             # compute loss
-            loss = criterion(probs, labels)
+            loss = criterion(logits, labels)
             running_loss += loss.item() * images.size(0)
             total_samples += images.size(0)
 
@@ -311,16 +307,16 @@ if __name__ == "__main__":
     # Parse command-line arguments.
     parser = argparse.ArgumentParser(description="Eval script for CAI6108 project")
     parser.add_argument("--model_path", type=str, required=True,
-                        help="Path to the trained model checkpoint (e.g., models/trained_model.pth)")
+                        help="Path to the trained model checkpoint (e.g., models/resnet50.pth)")
     parser.add_argument("--test_data", type=str, default="project_test_data",
                         help="Directory containing the test dataset with class subfolders")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for testing")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of workers for DataLoader")
     parser.add_argument("--image_size", type=int, default=128, help="Input image size")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Threshold for eval")
-    parser.add_argument("--group_id", type=int, required=True, help="Project Group ID (non-negative integer)")
-    parser.add_argument("--project_title", type=str, required=True, help="Project Title (at least 4 characters)")
-
+    parser.add_argument("--threshold", type=float, default=0.4, help="Threshold for eval")
+    parser.add_argument("--group_id", type=int, required=True, help="8")
+    parser.add_argument("--project_title", type=str, required=True, help="Multi Label Classification")
+   
     args = parser.parse_args()
 
     project_group_id = args.group_id
@@ -348,11 +344,11 @@ if __name__ == "__main__":
     print("Number of classes:", num_classes)
 
     # Load the trained model from the given checkpoint.
-    model = load_trained_model(args.model_path, num_classes, device, args.image_size)
+    model = load_trained_model(args.model_path, num_classes, device)
     print("Model loaded successfully from:", args.model_path)
 
     # Evaluate the model on test data.
-    test_metrics = evaluate_model(model, test_loader, device, threshold=model["threshold"])
+    test_metrics = evaluate_model(model, test_loader, device, threshold=args.threshold)
     print(f"Metrics: {test_metrics}")
 
     # Elapsed time.
