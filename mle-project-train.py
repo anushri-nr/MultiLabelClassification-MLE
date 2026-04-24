@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import argparse
 
 from PIL import Image
 
@@ -445,18 +446,25 @@ class MultiLabelModel(pl.LightningModule):
     return torch.optim.Adam(self.parameters(), lr = lr)
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method", type=str, default="latent", choices=["latent", "deep"])
+    parser.add_argument("--data_dir", type=str, default="aggregated-2")
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if method == "latent":
+
+    if args.method == "latent":
         encoder, feature_dim = create_encoder(device)
 
         data_set = load_train_dataset(
-            data_dir="aggregated-2",
+            data_dir=args.data_dir,
             batch_size=16,
             num_workers=1,
             image_size=128,
         )
 
-        data_loader = load_train_loader(data_set,
+        data_loader = load_train_loader(
+            data_set,
             batch_size=16,
             num_workers=1,
             image_size=128,
@@ -484,35 +492,33 @@ def main():
         print("Y_test shape:", Y_test.shape)
 
         best_pca, best_classifier, best_thresholds, best_result, results = tune_pca_and_classifier(
-        X_train, Y_train, X_val, Y_val, clf="logistic"
-    )
+            X_train, Y_train, X_val, Y_val, clf="logistic"
+        )
 
         plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_results_f1.png")
-
         plot_tuning_results(results, metric_name="hamming_acc", save_path="tuning_results_hamming.png")
 
-
         evaluate_on_test(
-        pca=best_pca,
-        classifier=best_classifier,
-        thresholds=best_thresholds,
-        X_test=X_test,
-        Y_test=Y_test,
-    )
-
+            pca=best_pca,
+            classifier=best_classifier,
+            thresholds=best_thresholds,
+            X_test=X_test,
+            Y_test=Y_test,
+        )
 
         save_model_bundle(
-        output_path="vgg_pca_logreg.pkl",
-        pca=best_pca,
-        classifier=best_classifier,
-        thresholds=best_thresholds,
-    )
+            output_path="vgg_pca_logreg.pkl",
+            pca=best_pca,
+            classifier=best_classifier,
+            thresholds=best_thresholds,
+        )
 
         print("\nSaved tuned model to vgg_pca_logreg.pkl")
         print("Training complete.")
+
     else:
         data_set = load_train_dataset(
-            data_dir="aggregated-2",
+            data_dir=args.data_dir,
             batch_size=16,
             num_workers=1,
             image_size=128,
@@ -528,33 +534,27 @@ def main():
             cfg = yaml.safe_load(f)
 
         checkpoint_callback = ModelCheckpoint(
-            dirpath="/content/drive/MyDrive/MLE/densenet/checkpoints/",
+            dirpath="/models/",
             filename="{epoch}-{val_loss:.2f}-{val_f1:.2f}",
-            monitor="val_f1",          # save based on best val F1
-            mode="max",                # higher F1 is better
-            save_top_k=3,              # keep top 3 checkpoints
-            save_last=True,            # always save the latest epoch too
+            monitor="val_f1",
+            mode="max",
+            save_top_k=3,
+            save_last=True,
         )
 
-        lr_monitor = LearningRateMonitor(logging_interval="epoch")  # logs LR to wandb
+        lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
         trainer = pl.Trainer(
-        max_epochs=cfg["training"]["num_epochs"],
+            max_epochs=cfg["training"]["num_epochs"],
             check_val_every_n_epoch=cfg["training"]["val_every"],
             accelerator="auto",
             devices="auto",
             log_every_n_steps=10,
-            callbacks = [checkpoint_callback, lr_monitor],
+            callbacks=[checkpoint_callback, lr_monitor],
         )
+
         pl_model = MultiLabelModel(cfg)
         tuner = Tuner(trainer)
-
-        data_loader = load_train_dataset(
-            data_dir="aggregated-2",
-            batch_size=16,
-            num_workers=1,
-            image_size=128,
-        )
 
         val_size = int(0.2 * len(data_set))
         train_size = len(data_set) - val_size
@@ -563,6 +563,7 @@ def main():
             [train_size, val_size],
             generator=torch.Generator().manual_seed(42)
         )
+
         train_loader = DataLoader(train_set, batch_size=16, shuffle=True, num_workers=2)
         val_loader = DataLoader(val_set, batch_size=16, shuffle=False, num_workers=2)
 
