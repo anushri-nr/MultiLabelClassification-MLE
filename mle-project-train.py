@@ -356,65 +356,6 @@ def plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_resul
     plt.show()
 
 
-def visualize_sample_predictions(model_bundle, dataset, device, num_samples=6, image_size=128):
-    encoder = model_bundle["encoder"]
-    pca = model_bundle["pca"]
-    classifier = model_bundle["classifier"]
-    threshold = model_bundle["threshold"]
-
-    display_transform = transforms.Compose([
-        transforms.Resize((image_size, image_size))
-    ])
-
-    plt.figure(figsize=(15, 8))
-
-    indices = np.random.choice(len(dataset), size=min(num_samples, len(dataset)), replace=False)
-
-    for plot_idx, data_idx in enumerate(indices, 1):
-        img_path, true_target = dataset.samples[data_idx]
-
-        image = Image.open(img_path).convert("RGB")
-        image_display = display_transform(image)
-
-        input_transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-
-        x = input_transform(image).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            features = encoder(x).cpu().numpy()
-
-        features_pca = pca.transform(features)
-
-        if hasattr(classifier, "predict_proba"):
-            probs = classifier.predict_proba(features_pca)[0]
-        else:
-            scores = classifier.decision_function(features_pca)[0]
-            probs = 1.0 / (1.0 + np.exp(-scores))
-
-        pred_target = (probs >= threshold).astype(np.float32)
-
-        true_labels = [LABEL_ORDER[i] for i, v in enumerate(true_target.tolist()) if v == 1]
-        pred_labels = [LABEL_ORDER[i] for i, v in enumerate(pred_target.tolist()) if v == 1]
-
-        plt.subplot(2, 3, plot_idx)
-        plt.imshow(image_display)
-        plt.axis("off")
-        plt.title(
-            f"True: {', '.join(true_labels)}\nPred: {', '.join(pred_labels)}",
-            fontsize=9
-        )
-
-    plt.tight_layout()
-    plt.show()
-
-
 def visualize_test_predictions(model_bundle, dataset, test_indices, X_test, Y_test, device, num_samples=6, image_size=128):
     encoder = model_bundle["encoder"]
     pca = model_bundle["pca"]
