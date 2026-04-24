@@ -21,6 +21,9 @@ import re
 from pathlib import Path
 from PIL import Image
 
+import pickle
+import numpy as np
+
 import torch
 import torch.nn as nn
 from torchvision import models, datasets, transforms
@@ -124,19 +127,62 @@ def load_trained_model(model_path, num_labels, device, image_size):
         model: The model loaded on device. (If you are not using pytorch nn.Module directly, it is fine but make sure what it loads is compatible with the rest of the code.)
     """
 
-    model = CREATE_YOUR_MODEL_HERE(num_labels=num_labels) # Replace with your model creation function
+    # model = CREATE_YOUR_MODEL_HERE(num_labels=num_labels) # Replace with your model creation function
 
     ## Change/rewrite the rest of the function as needed, but make sure what it outputs works with the other functions (e.g., predict)
 
     # Load local state dictionary
-    state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
+    # state_dict = torch.load(model_path, map_location=device)
+    # model.load_state_dict(state_dict)
 
-    # Move the model to the specified device and set evaluation mode.
-    model = model.to(device)
-    model.eval()
+    # # Move the model to the specified device and set evaluation mode.
+    # model = model.to(device)
+    # model.eval()
 
+    # return model
+    del num_labels, image_size
+
+    with open(model_path, "rb") as f:
+        bundle = pickle.load(f)
+
+    encoder_name = bundle.get("encoder_name", "vgg16")
+    encoder = create_encoder(device, encoder_name)
+
+    pca = bundle["pca"]
+    classifier = bundle["classifier"]
+    threshold = bundle.get("threshold", 0.5)
+
+    model = {
+        "encoder": encoder,
+        "pca": pca,
+        "classifier": classifier,
+        "threshold": threshold,
+    }
     return model
+
+class VGGEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        weights = models.VGG16_Weights.DEFAULT
+        vgg = models.vgg16(weights=weights)
+        self.features = vgg.features
+        self.avgpool = vgg.avgpool
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return x
+
+def create_encoder(device, encoder_name="vgg16"):
+    if encoder_name != "vgg16":
+        raise ValueError(f"Unsupported encoder: {encoder_name}")
+    encoder = VGGEncoder().to(device)
+    encoder.eval()
+    return encoder
 
 
 def predict(model, x, threshold=0.5):
@@ -156,11 +202,39 @@ def predict(model, x, threshold=0.5):
 
     ## Change/rewrite the function as needed, but make sure it outputs predictions in a way that it works with the rest of the code
     ## the code below assumes your model outputs logits, change it if needed...
+    # with torch.no_grad():
+    #     logits = model(x)
+    #     probs = torch.sigmoid(logits)
+    #     preds = (probs >= threshold).float()
+    # return preds, probs, logits     # the code needs to return all of this for evaluate_model() to work!
+    encoder = model["encoder"]
+    pca = model["pca"]
+    classifier = model["classifier"]
+
     with torch.no_grad():
-        logits = model(x)
-        probs = torch.sigmoid(logits)
-        preds = (probs >= threshold).float()
-    return preds, probs, logits     # the code needs to return all of this for evaluate_model() to work!
+        features = encoder(x)
+        features = features.cpu().numpy()
+
+    features_pca = pca.transform(features)
+
+    if hasattr(classifier, "predict_proba"):
+        probs = classifier.predict_proba(features_pca)
+    else:
+        scores = classifier.decision_function(features_pca)
+        probs = 1.0 / (1.0 + np.exp(-scores))
+
+    probs = np.asarray(probs, dtype=np.float32)
+    preds = (probs >= threshold).astype(np.float32)
+
+    clipped = np.clip(probs, 1e-6, 1 - 1e-6)
+    logits = np.log(clipped / (1.0 - clipped))
+
+    preds = torch.from_numpy(preds).float().to(x.device)
+    probs = torch.from_numpy(probs).float().to(x.device)
+    logits = torch.from_numpy(logits).float().to(x.device)
+
+
+    return preds, probs, logits
 
 
 def evaluate_model(model, test_loader, device, threshold=0.5):
@@ -175,8 +249,9 @@ def evaluate_model(model, test_loader, device, threshold=0.5):
     Returns:
         tuple: (test_loss, test_accuracy)
     """
-    criterion = nn.BCEWithLogitsLoss()  # again this assumes the model output is logits
+    criterion = nn.BCELoss()
     running_loss = 0.0
+    total_samples = 0
 
     ## Change/rewrite the function as needed, but make sure it computes all these metrics correctly!
     ## Do *not* remove or change metrics. You can add new metrics if you want.)
@@ -190,7 +265,7 @@ def evaluate_model(model, test_loader, device, threshold=0.5):
             preds, probs, logits = predict(model, images, threshold=threshold)
 
             # compute loss
-            loss = criterion(logits, labels)
+            loss = criterion(probs, labels)
             running_loss += loss.item() * images.size(0)
             total_samples += images.size(0)
 
@@ -277,7 +352,7 @@ if __name__ == "__main__":
     print("Model loaded successfully from:", args.model_path)
 
     # Evaluate the model on test data.
-    test_metrics = evaluate_model(model, test_loader, device, threshold=args.threshold)
+    test_metrics = evaluate_model(model, test_loader, device, threshold=model["threshold"])
     print(f"Metrics: {test_metrics}")
 
     # Elapsed time.
