@@ -8,6 +8,17 @@ import matplotlib.pyplot as plt
 
 from PIL import Image
 
+from datetime import datetime
+import yaml
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models, transforms
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.tuner import Tuner
+
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.svm import LinearSVC, SVC
 from sklearn.decomposition import PCA
@@ -15,12 +26,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.metrics import f1_score
-
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms
 
 LABEL_ORDER = [
     "pen", "paper", "book", "clock", "phone", "laptop",
@@ -85,9 +90,11 @@ def load_train_dataset(data_dir, batch_size, num_workers, image_size, shuffle=Fa
 
     train_dataset = CustomDirectoryLayoutDataset(root=data_dir, transform=train_transforms)
     assert len(train_dataset) > 0, f"Empty dataset found ({data_dir})."
+    return train_dataset 
 
+def load_train_loader(dataset, batch_size, shuffle, num_workers):
     train_loader = DataLoader(
-        train_dataset,
+        dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
@@ -398,72 +405,170 @@ def visualize_test_predictions(model_bundle, dataset, test_indices, X_test, Y_te
     plt.tight_layout()
     plt.show()
 
+class MultiLabelModel(pl.LightningModule):
+  def __init__(self, cfg):
+    super().__init__()
+    self.save_hyperparameters()
+    self.cfg = cfg
+    self.model = build_cnn(
+        num_classes = cfg["model"]["num_classes"],
+        backbone = cfg["model"]["backbone"]
+    )
+    self.lr        = cfg["optimizer"]["lr"]
+    self.criterion = nn.BCEWithLogitsLoss()
+    self.f1 = MultilabelF1Score(num_labels=cfg["model"]["num_classes"])
+    self.auroc = MultilabelAUROC(num_labels=cfg["model"]["num_classes"])
+
+  def forward(self, x):
+    return self.model(x)
+
+  def training_step(self, batch, batch_idx):
+    images, labels = batch
+    logits = self(images)
+    loss = self.criterion(logits, labels.float())
+    self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+    return loss
+
+  def validation_step(self, batch, batch_idx):
+    images, labels = batch
+    logits = self(images)
+    loss = self.criterion(logits, labels.float())
+    #Added the probs since metrics needs this
+    probs  = torch.sigmoid(logits)
+    self.log("val_loss", loss, prog_bar=True)
+    self.log("val_f1",   self.f1(probs, labels.int()),    prog_bar=True)
+    self.log("val_auroc",self.auroc(probs, labels.int()), prog_bar=True)
+    self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+
+  def configure_optimizers(self):
+    lr = self.lr if hasattr(self, "lr") else self.cfg["optimizer"]["lr"]
+    return torch.optim.Adam(self.parameters(), lr = lr)
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    encoder, feature_dim = create_encoder(device)
+    if method == "latent":
+        encoder, feature_dim = create_encoder(device)
 
-    data_loader = load_train_dataset(
-        data_dir="aggregated-2",
-        batch_size=16,
-        num_workers=1,
-        image_size=128,
+        data_set = load_train_dataset(
+            data_dir="aggregated-2",
+            batch_size=16,
+            num_workers=1,
+            image_size=128,
+        )
+
+        data_loader = load_train_loader(data_set,
+            batch_size=16,
+            num_workers=1,
+            image_size=128,
+        )
+
+        X, Y = extract_features(encoder, data_loader, device)
+
+        print("Feature dim:", feature_dim)
+        print("X shape:", X.shape)
+        print("Y shape:", Y.shape)
+
+        X_train_val, X_test, Y_train_val, Y_test = train_test_split(
+            X, Y, test_size=0.15, random_state=42
+        )
+
+        X_train, X_val, Y_train, Y_val = train_test_split(
+            X_train_val, Y_train_val, test_size=0.1765, random_state=42
+        )
+
+        print("X_train shape:", X_train.shape)
+        print("Y_train shape:", Y_train.shape)
+        print("X_val shape:", X_val.shape)
+        print("Y_val shape:", Y_val.shape)
+        print("X_test shape:", X_test.shape)
+        print("Y_test shape:", Y_test.shape)
+
+        best_pca, best_classifier, best_thresholds, best_result, results = tune_pca_and_classifier(
+        X_train, Y_train, X_val, Y_val, clf="logistic"
     )
 
-    X, Y = extract_features(encoder, data_loader, device)
+        plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_results_f1.png")
 
-    print("Feature dim:", feature_dim)
-    print("X shape:", X.shape)
-    print("Y shape:", Y.shape)
+        plot_tuning_results(results, metric_name="hamming_acc", save_path="tuning_results_hamming.png")
 
-    X_train_val, X_test, Y_train_val, Y_test = train_test_split(
-        X, Y, test_size=0.15, random_state=42
+
+        evaluate_on_test(
+        pca=best_pca,
+        classifier=best_classifier,
+        thresholds=best_thresholds,
+        X_test=X_test,
+        Y_test=Y_test,
     )
 
-    X_train, X_val, Y_train, Y_val = train_test_split(
-        X_train_val, Y_train_val, test_size=0.1765, random_state=42
+
+        save_model_bundle(
+        output_path="vgg_pca_logreg.pkl",
+        pca=best_pca,
+        classifier=best_classifier,
+        thresholds=best_thresholds,
     )
 
-    print("X_train shape:", X_train.shape)
-    print("Y_train shape:", Y_train.shape)
-    print("X_val shape:", X_val.shape)
-    print("Y_val shape:", Y_val.shape)
-    print("X_test shape:", X_test.shape)
-    print("Y_test shape:", Y_test.shape)
+        print("\nSaved tuned model to vgg_pca_logreg.pkl")
+        print("Training complete.")
+    else:
+        data_set = load_train_dataset(
+            data_dir="aggregated-2",
+            batch_size=16,
+            num_workers=1,
+            image_size=128,
+        )
 
-    best_pca, best_classifier, best_thresholds, best_result, results = tune_pca_and_classifier(
-    X_train, Y_train, X_val, Y_val, clf="logistic"
-)
+        RESNET_CFG = "/configs/resnet_config.yaml"
+        EFFICIENTNET_CFG = "/configs/efficientnet_config.yaml"
+        DENSENET_CFG = "/configs/densenet121_config.yaml"
 
+        CFG = DENSENET_CFG
 
-    # best_pca_svm, best_classifier_svm, best_result_svm, results_svm = tune_pca_and_classifier(
-    #     X_train, Y_train, X_val, Y_val, clf="svm"
-    # )
+        with open(CFG) as f:
+            cfg = yaml.safe_load(f)
 
-    plot_tuning_results(results, metric_name="f1_micro", save_path="tuning_results_f1.png")
+        checkpoint_callback = ModelCheckpoint(
+            dirpath="/content/drive/MyDrive/MLE/densenet/checkpoints/",
+            filename="{epoch}-{val_loss:.2f}-{val_f1:.2f}",
+            monitor="val_f1",          # save based on best val F1
+            mode="max",                # higher F1 is better
+            save_top_k=3,              # keep top 3 checkpoints
+            save_last=True,            # always save the latest epoch too
+        )
 
-    plot_tuning_results(results, metric_name="hamming_acc", save_path="tuning_results_hamming.png")
+        lr_monitor = LearningRateMonitor(logging_interval="epoch")  # logs LR to wandb
 
+        trainer = pl.Trainer(
+        max_epochs=cfg["training"]["num_epochs"],
+            check_val_every_n_epoch=cfg["training"]["val_every"],
+            accelerator="auto",
+            devices="auto",
+            log_every_n_steps=10,
+            callbacks = [checkpoint_callback, lr_monitor],
+        )
+        pl_model = MultiLabelModel(cfg)
+        tuner = Tuner(trainer)
 
-    evaluate_on_test(
-    pca=best_pca,
-    classifier=best_classifier,
-    thresholds=best_thresholds,
-    X_test=X_test,
-    Y_test=Y_test,
-)
+        data_loader = load_train_dataset(
+            data_dir="aggregated-2",
+            batch_size=16,
+            num_workers=1,
+            image_size=128,
+        )
 
+        val_size = int(0.2 * len(data_set))
+        train_size = len(data_set) - val_size
+        train_set, val_set = torch.utils.data.random_split(
+            data_set,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+        train_loader = DataLoader(train_set, batch_size=16, shuffle=True, num_workers=2)
+        val_loader = DataLoader(val_set, batch_size=16, shuffle=False, num_workers=2)
 
-    save_model_bundle(
-    output_path="vgg_pca_logreg.pkl",
-    pca=best_pca,
-    classifier=best_classifier,
-    thresholds=best_thresholds,
-)
-
-
-    print("\nSaved tuned model to vgg_pca_logreg.pkl")
-    print("Training complete.")
+        tuner.lr_find(pl_model, train_loader, val_loader)
+        trainer.fit(pl_model, train_loader, val_loader)
+        print(f"Best model: {checkpoint_callback.best_model_path}")
 
 
 if __name__ == "__main__":
