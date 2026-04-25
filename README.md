@@ -17,7 +17,7 @@ The strongest reported model was EfficientNet-B3, which achieved a validation mi
 
 ```text
 .
-├── aggregated-2/                         # Training dataset
+├── data                         # Training dataset
 ├── configs/                              # CNN backbone config files
 │   ├── densenet121_config.yaml
 │   ├── efficientnet_config.yaml
@@ -36,7 +36,7 @@ The dataset is expected to use a custom directory layout where each subdirectory
 Example:
 
 ```text
-aggregated-2/
+data/
 ├── chair_bottle/
 │   ├── img1.png
 │   └── img2.png
@@ -87,7 +87,7 @@ The deep models replace the final classifier layer with a 12-output linear layer
 Run the latent-feature training pipeline:
 
 ```bash
-python mle-project-train.py --method latent --data_dir aggregated-2
+python mle-project-train.py --method latent --data_dir data
 ```
 
 This pipeline:
@@ -177,7 +177,6 @@ The dataset is moderately sized, and rare label combinations are underrepresente
 ## Notes
 
 - All labels are multi-hot encoded in the fixed order listed at the top of this README.
-- The default dataset path is `aggregated-2`.
 - The default image size is `128`.
 - The project expects PNG files with names matching `img*.png`.
 
